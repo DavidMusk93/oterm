@@ -7,6 +7,7 @@ pub const OP_RESIZE: u8 = 0x02;
 pub const OP_ACK: u8 = 0x03;
 pub const OP_PING: u8 = 0x04;
 pub const OP_ATTACH: u8 = 0x05;
+pub const OP_ACTIVITY: u8 = 0x06;
 
 // Server -> Client opcodes
 pub const OP_OUTPUT: u8 = 0x11;
@@ -69,6 +70,7 @@ pub enum ClientFrame {
     Ack { seq: u64 },
     Ping { client_ts_ms: u64 },
     Attach(AttachPayload),
+    Activity,
 }
 
 pub fn decode_client_frame(mut data: Bytes) -> Result<ClientFrame, String> {
@@ -107,6 +109,7 @@ pub fn decode_client_frame(mut data: Bytes) -> Result<ClientFrame, String> {
                 serde_json::from_slice(&data).map_err(|e| format!("invalid attach json: {e}"))?;
             Ok(ClientFrame::Attach(payload))
         }
+        OP_ACTIVITY => Ok(ClientFrame::Activity),
         other => Err(format!("unknown client opcode 0x{other:02x}")),
     }
 }
@@ -168,6 +171,12 @@ mod tests {
             ClientFrame::Ack { seq } => assert_eq!(seq, 987654321),
             _ => panic!("wrong variant"),
         }
+
+        let act = Bytes::from_static(&[OP_ACTIVITY]);
+        assert!(matches!(
+            decode_client_frame(act).unwrap(),
+            ClientFrame::Activity
+        ));
     }
 
     #[test]

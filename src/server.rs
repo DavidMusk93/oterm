@@ -24,6 +24,8 @@ use tracing::{debug, info, warn};
 
 const MAX_IN_FLIGHT_BYTES: u64 = 256 * 1024;
 const WS_CLOSE_AUTH_EXPIRED: u16 = 4401;
+/// Transport cookie lifetime; actual session idle expiry is strictly enforced in `AuthManager`.
+const COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/api/health", get(health))
         .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/touch", post(auth_touch))
         .route("/api/auth/verify", post(auth_verify))
         .route("/api/auth/logout", post(auth_logout))
         .route("/api/sessions", get(list_sessions).post(create_session))
@@ -181,6 +184,17 @@ fn cookie_path(base_path: &str) -> String {
     }
 }
 
+fn build_session_cookie(token: String, base_path: &str, secure: bool, auth_ttl_secs: u64) -> Cookie<'static> {
+    let mut cookie = Cookie::new(COOKIE_NAME, token);
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Strict);
+    cookie.set_path(cookie_path(base_path));
+    cookie.set_secure(secure);
+    let max_age = (auth_ttl_secs as i64).max(COOKIE_MAX_AGE_SECS);
+    cookie.set_max_age(time::Duration::seconds(max_age));
+    cookie
+}
+
 #[derive(Serialize)]
 struct AuthStatusResp {
     authenticated: bool,
@@ -189,16 +203,47 @@ struct AuthStatusResp {
 }
 
 async fn auth_status(State(state): State<AppState>, jar: CookieJar) -> Json<AuthStatusResp> {
-    let ttl_secs = jar
+    let rem = jar
         .get(COOKIE_NAME)
-        .and_then(|c| state.auth.validate(c.value()))
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .and_then(|c| state.auth.validate(c.value()));
+    let ttl_secs = rem.map(|d| d.as_secs().max(1)).unwrap_or(0);
     Json(AuthStatusResp {
-        authenticated: ttl_secs > 0,
+        authenticated: rem.is_some(),
         ttl_secs,
         auth_ttl_max: state.auth.auth_ttl_secs(),
     })
+}
+
+async fn auth_touch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    let Some(token) = jar.get(COOKIE_NAME).map(|c| c.value().to_string()) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "auth_required" })),
+        )
+            .into_response();
+    };
+    let Some(rem) = state.auth.touch(&token) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "auth_expired" })),
+        )
+            .into_response();
+    };
+    let secure = is_https_request(&headers, state.secure_cookie);
+    let cookie = build_session_cookie(token, &state.base_path, secure, state.auth.auth_ttl_secs());
+    (
+        jar.add(cookie),
+        Json(AuthStatusResp {
+            authenticated: true,
+            ttl_secs: rem.as_secs().max(1),
+            auth_ttl_max: state.auth.auth_ttl_secs(),
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -217,12 +262,12 @@ async fn auth_verify(
     match state.auth.authenticate(&req.code, &ip) {
         Ok(session) => {
             let secure = is_https_request(&headers, state.secure_cookie);
-            let mut cookie = Cookie::new(COOKIE_NAME, session.token);
-            cookie.set_http_only(true);
-            cookie.set_same_site(SameSite::Strict);
-            cookie.set_path(cookie_path(&state.base_path));
-            cookie.set_secure(secure);
-            cookie.set_max_age(time::Duration::seconds(state.auth.auth_ttl_secs() as i64));
+            let cookie = build_session_cookie(
+                session.token,
+                &state.base_path,
+                secure,
+                state.auth.auth_ttl_secs(),
+            );
 
             info!("OTP authentication succeeded for {ip}");
             (
@@ -306,6 +351,27 @@ fn require_auth(state: &AppState, jar: &CookieJar) -> Result<String, Response> {
     Ok(token)
 }
 
+fn require_auth_touch(state: &AppState, jar: &CookieJar) -> Result<String, Response> {
+    let token = jar
+        .get(COOKIE_NAME)
+        .map(|c| c.value().to_string())
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "auth_required" })),
+            )
+                .into_response()
+        })?;
+    if state.auth.touch(&token).is_none() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "auth_expired" })),
+        )
+            .into_response());
+    }
+    Ok(token)
+}
+
 async fn list_sessions(State(state): State<AppState>, jar: CookieJar) -> Response {
     if let Err(resp) = require_auth(&state, &jar) {
         return resp;
@@ -332,7 +398,7 @@ async fn create_session(
     jar: CookieJar,
     Json(req): Json<CreateSessionReq>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &jar) {
+    if let Err(resp) = require_auth_touch(&state, &jar) {
         return resp;
     }
     match state
@@ -359,7 +425,7 @@ async fn rename_session(
     Path(id): Path<String>,
     Json(req): Json<RenameSessionReq>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &jar) {
+    if let Err(resp) = require_auth_touch(&state, &jar) {
         return resp;
     }
     match state.sessions.get(&id) {
@@ -380,7 +446,7 @@ async fn delete_session(
     jar: CookieJar,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &jar) {
+    if let Err(resp) = require_auth_touch(&state, &jar) {
         return resp;
     }
     if state.sessions.delete(&id) {
@@ -554,9 +620,13 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                                 backpressure_paused = false;
                             }
                             Ok(ClientFrame::Input(bytes)) => {
+                                let _ = state.auth.touch(&auth_token);
                                 if let Some(guard) = &attached {
                                     let _ = guard.session.write_input(&bytes);
                                 }
+                            }
+                            Ok(ClientFrame::Activity) => {
+                                let _ = state.auth.touch(&auth_token);
                             }
                             Ok(ClientFrame::Resize { cols, rows }) => {
                                 if let Some(guard) = &attached {
@@ -569,7 +639,7 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                                 }
                             }
                             Ok(ClientFrame::Ping { client_ts_ms }) => {
-                                let pong = encode_pong(client_ts_ms, rem_ttl.as_secs() as u32);
+                                let pong = encode_pong(client_ts_ms, rem_ttl.as_secs().max(1) as u32);
                                 if ws_tx.send(Message::Binary(pong)).await.is_err() {
                                     break;
                                 }

@@ -1,6 +1,7 @@
 import {
   decodeServerFrame,
   encodeAck,
+  encodeActivity,
   encodeAttach,
   encodeInput,
   encodePing,
@@ -13,6 +14,7 @@ import { initMobileSupport, type MobileController } from "./mobile";
 const WS_CLOSE_AUTH_EXPIRED = 4401;
 const PING_INTERVAL_MS = 20_000;
 const PONG_TIMEOUT_MS = 10_000;
+const ACTIVITY_THROTTLE_MS = 2_000;
 
 class OtermApp {
   private view!: OtermView;
@@ -20,12 +22,17 @@ class OtermApp {
   private ws: WebSocket | null = null;
   private sessions: SessionInfo[] = [];
   private activeSessionId: string | null = null;
-  // Monotonic sequence numbers preserved across reconnects AND 5-min OTP lock/unlock!
+  // Monotonic sequence numbers preserved across reconnects AND idle OTP lock/unlock!
   private lastSeqBySession = new Map<string, bigint>();
 
   private authenticated = false;
   private authTtlSecs = 0;
+  private authTtlMax = 300;
   private hasEverUnlocked = false;
+
+  private lastTouchAtMs = 0;
+  private lastTouchSentAtMs = 0;
+  private activityFlushTimer: number | null = null;
 
   private reconnectAttempt = 0;
   private reconnectTimer: number | null = null;
@@ -86,6 +93,7 @@ class OtermApp {
     });
 
     this.bindUI();
+    this.bindActivityListeners();
     this.startTtlTicker();
 
     // Instant reconnect on network recovery or tab wake
@@ -218,6 +226,60 @@ class OtermApp {
     });
   }
 
+  private bindActivityListeners(): void {
+    const onUserEvent = (ev: Event) => {
+      if (!this.authenticated) return;
+      const target = ev.target instanceof Element ? ev.target : null;
+      if (target?.closest("#btn-lock, #auth-overlay")) return;
+      this.recordUserActivity(false);
+    };
+
+    window.addEventListener("keydown", onUserEvent, { capture: true });
+    window.addEventListener("pointerdown", onUserEvent, { capture: true, passive: true });
+    window.addEventListener("wheel", onUserEvent, { capture: true, passive: true });
+    window.addEventListener("touchstart", onUserEvent, { capture: true, passive: true });
+    window.addEventListener("paste", onUserEvent, { capture: true });
+  }
+
+  private recordUserActivity(sentViaInput: boolean): void {
+    if (!this.authenticated) return;
+    const now = Date.now();
+    this.lastTouchAtMs = now;
+    if (this.authTtlMax > 0) {
+      this.authTtlSecs = this.authTtlMax;
+      this.updateTtlDisplay();
+    }
+
+    if (sentViaInput) {
+      this.lastTouchSentAtMs = now;
+      if (this.activityFlushTimer !== null) {
+        window.clearTimeout(this.activityFlushTimer);
+        this.activityFlushTimer = null;
+      }
+      return;
+    }
+
+    const elapsed = now - this.lastTouchSentAtMs;
+    if (elapsed >= ACTIVITY_THROTTLE_MS) {
+      this.flushActivityTouch();
+    } else if (this.activityFlushTimer === null) {
+      this.activityFlushTimer = window.setTimeout(() => {
+        this.activityFlushTimer = null;
+        this.flushActivityTouch();
+      }, ACTIVITY_THROTTLE_MS - elapsed);
+    }
+  }
+
+  private flushActivityTouch(): void {
+    if (!this.authenticated) return;
+    this.lastTouchSentAtMs = Date.now();
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(encodeActivity());
+    } else {
+      fetch("./api/auth/touch", { method: "POST" }).catch(() => {});
+    }
+  }
+
   private openSearch(): void {
     this.searchBar.classList.remove("hidden");
     this.searchInput.focus();
@@ -236,9 +298,13 @@ class OtermApp {
       const data = (await resp.json()) as {
         authenticated: boolean;
         ttl_secs: number;
+        auth_ttl_max?: number;
       };
+      if (data.auth_ttl_max && data.auth_ttl_max > 0) {
+        this.authTtlMax = data.auth_ttl_max;
+      }
       if (data.authenticated) {
-        this.onAuthenticated(data.ttl_secs);
+        this.onAuthenticated(data.ttl_secs, data.auth_ttl_max);
       } else {
         this.showAuthOverlay(
           "OTP Verification",
@@ -276,7 +342,7 @@ class OtermApp {
 
       this.otpInput.value = "";
       this.otpInput.disabled = false;
-      this.onAuthenticated(data.ttl_secs);
+      this.onAuthenticated(data.ttl_secs, data.auth_ttl_max);
     } catch {
       this.authError.textContent = "Network error verifying OTP.";
       this.authError.classList.remove("hidden");
@@ -285,9 +351,16 @@ class OtermApp {
     }
   }
 
-  private async onAuthenticated(ttlSecs: number): Promise<void> {
+  private async onAuthenticated(ttlSecs: number, ttlMax?: number): Promise<void> {
+    if (ttlMax && ttlMax > 0) {
+      this.authTtlMax = ttlMax;
+    } else if (ttlSecs > this.authTtlMax) {
+      this.authTtlMax = ttlSecs;
+    }
     this.authenticated = true;
     this.authTtlSecs = ttlSecs;
+    this.lastTouchAtMs = Date.now();
+    this.lastTouchSentAtMs = Date.now();
     this.hasEverUnlocked = true;
     this.authOverlay.classList.add("hidden");
     this.updateTtlDisplay();
@@ -303,6 +376,10 @@ class OtermApp {
     this.authTtlSecs = 0;
     this.updateTtlDisplay();
     this.stopHeartbeat();
+    if (this.activityFlushTimer !== null) {
+      window.clearTimeout(this.activityFlushTimer);
+      this.activityFlushTimer = null;
+    }
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -319,7 +396,7 @@ class OtermApp {
     // NOTE: We intentionally do NOT clear xterm.js or lastSeqBySession!
     // Terminal content stays intact underneath the overlay.
     this.showAuthOverlay(
-      this.hasEverUnlocked ? "Session Locked (OTP Expired)" : "OTP Verification",
+      this.hasEverUnlocked ? "Session Locked (Idle Timeout)" : "OTP Verification",
       message
     );
   }
@@ -337,7 +414,7 @@ class OtermApp {
   private async refreshSessions(): Promise<void> {
     const resp = await fetch("./api/sessions", { cache: "no-store" });
     if (resp.status === 401) {
-      this.lockSession("5-minute OTP session expired. Enter OTP to resume without losing terminal state.");
+      this.lockSession("Session locked after inactivity. Enter OTP to resume without losing terminal state.");
       return;
     }
     const data = (await resp.json()) as { sessions: SessionInfo[] };
@@ -479,8 +556,10 @@ class OtermApp {
         case "pong": {
           const rtt = Number(BigInt(Date.now()) - frame.clientTsMs);
           this.rttBadge.textContent = `${Math.max(0, rtt)}ms`;
-          this.authTtlSecs = frame.authTtlSecs;
-          this.updateTtlDisplay();
+          if (Number(frame.clientTsMs) >= this.lastTouchAtMs) {
+            this.authTtlSecs = frame.authTtlSecs;
+            this.updateTtlDisplay();
+          }
           if (this.pongWatchdog !== null) {
             window.clearTimeout(this.pongWatchdog);
             this.pongWatchdog = null;
@@ -497,7 +576,7 @@ class OtermApp {
         }
         case "auth_lock":
           this.lockSession(
-            "5-minute OTP session expired. Your terminal is untouched — enter OTP to resume."
+            "Session locked after inactivity. Your terminal is untouched — enter OTP to resume."
           );
           break;
         case "error":
@@ -513,7 +592,7 @@ class OtermApp {
 
       if (ev.code === WS_CLOSE_AUTH_EXPIRED) {
         this.lockSession(
-          "5-minute OTP session expired. Your terminal is untouched — enter OTP to resume."
+          "Session locked after inactivity. Your terminal is untouched — enter OTP to resume."
         );
         return;
       }
@@ -542,6 +621,7 @@ class OtermApp {
   private sendInput(data: string): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(encodeInput(data));
+    this.recordUserActivity(true);
   }
 
   private startHeartbeat(): void {
@@ -585,10 +665,17 @@ class OtermApp {
       // Check if auth expired while offline
       try {
         const r = await fetch("./api/auth/status", { cache: "no-store" });
-        const d = (await r.json()) as { authenticated: boolean; ttl_secs: number };
+        const d = (await r.json()) as {
+          authenticated: boolean;
+          ttl_secs: number;
+          auth_ttl_max?: number;
+        };
+        if (d.auth_ttl_max && d.auth_ttl_max > 0) {
+          this.authTtlMax = d.auth_ttl_max;
+        }
         if (!d.authenticated) {
           this.lockSession(
-            "5-minute OTP session expired. Your terminal is untouched — enter OTP to resume."
+            "Session locked after inactivity. Your terminal is untouched — enter OTP to resume."
           );
           return;
         }

@@ -34,7 +34,7 @@
           <option value="light">Solarized Light</option>
         </select>
         <button id="btn-mobile-bar" class="icon-btn" title="Toggle touch key bar">⌨</button>
-        <button id="btn-lock" class="ttl-pill" title="OTP session remaining — click to lock now">
+        <button id="btn-lock" class="ttl-pill" title="Idle lock countdown (auto-renews while active) — click to lock now">
           <span class="lock-icon">🔒</span>
           <span id="ttl-text">--:--</span>
         </button>
@@ -101,7 +101,7 @@
       </form>
       <div id="auth-error" class="auth-error hidden"></div>
       <div class="auth-footnote">
-        Server-bound TOTP · 5-minute session keepalive · PTY stays alive when locked
+        Server-bound TOTP · 5-min idle auto-lock (auto-renews while active) · PTY stays alive
       </div>
     </div>
   </div>

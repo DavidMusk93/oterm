@@ -137,6 +137,24 @@ impl AuthManager {
         }
     }
 
+    /// Renew an active session's idle expiration back to `auth_ttl` on user activity.
+    /// Returns the renewed TTL if the session is still valid, or `None` if expired/unknown.
+    pub fn touch(&self, token: &str) -> Option<Duration> {
+        if self.auth_ttl.is_zero() {
+            return None;
+        }
+        let now = Instant::now();
+        let mut sessions = self.sessions.write().unwrap();
+        let session = sessions.get_mut(token)?;
+        if session.expires_at > now {
+            session.expires_at = now + self.auth_ttl;
+            Some(self.auth_ttl)
+        } else {
+            sessions.remove(token);
+            None
+        }
+    }
+
     /// Revoke an active session (manual lock).
     pub fn revoke(&self, token: &str) {
         let mut sessions = self.sessions.write().unwrap();
@@ -340,6 +358,38 @@ mod tests {
         let totp = build_totp(secret, "oterm", "test").unwrap();
         let code = totp.generate_current().unwrap();
         let session = mgr.authenticate(&code, "127.0.0.1").unwrap();
+        assert!(mgr.validate(&session.token).is_none());
+        assert!(mgr.touch(&session.token).is_none());
+    }
+
+    #[test]
+    fn touch_renews_active_session_and_rejects_expired() {
+        let secret = generate_secret_bytes();
+        let mgr = AuthManager::new(secret.clone(), "oterm", "test", 2).unwrap();
+        let totp = build_totp(secret, "oterm", "test").unwrap();
+        let code = totp.generate_current().unwrap();
+        let session = mgr.authenticate(&code, "127.0.0.1").unwrap();
+
+        // Simulate time passing so remaining TTL drops below 1.2s
+        {
+            let mut sessions = mgr.sessions.write().unwrap();
+            let entry = sessions.get_mut(&session.token).unwrap();
+            entry.expires_at = Instant::now() + Duration::from_millis(500);
+        }
+        assert!(mgr.validate(&session.token).unwrap() <= Duration::from_millis(500));
+
+        // User activity renews full 2s TTL
+        let renewed = mgr.touch(&session.token).unwrap();
+        assert_eq!(renewed, Duration::from_secs(2));
+        assert!(mgr.validate(&session.token).unwrap() > Duration::from_millis(1500));
+
+        // Once expired, touch must not resurrect session
+        {
+            let mut sessions = mgr.sessions.write().unwrap();
+            let entry = sessions.get_mut(&session.token).unwrap();
+            entry.expires_at = Instant::now() - Duration::from_millis(10);
+        }
+        assert!(mgr.touch(&session.token).is_none());
         assert!(mgr.validate(&session.token).is_none());
     }
 }

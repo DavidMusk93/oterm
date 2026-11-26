@@ -5,6 +5,7 @@ export const OP_RESIZE = 0x02;
 export const OP_ACK = 0x03;
 export const OP_PING = 0x04;
 export const OP_ATTACH = 0x05;
+export const OP_ACTIVITY = 0x06;
 
 export const OP_OUTPUT = 0x11;
 export const OP_SNAPSHOT = 0x12;
@@ -69,6 +70,10 @@ export function encodePing(clientTsMs: bigint): Uint8Array {
   view.setUint8(0, OP_PING);
   view.setBigUint64(1, clientTsMs, false);
   return new Uint8Array(buf);
+}
+
+export function encodeActivity(): Uint8Array {
+  return new Uint8Array([OP_ACTIVITY]);
 }
 
 export function encodeAttach(

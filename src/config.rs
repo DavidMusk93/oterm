@@ -34,7 +34,7 @@ pub struct ServeArgs {
     #[arg(long, env = "OTERM_SECRET_PATH", default_value = "/etc/oterm/totp.secret")]
     pub secret_path: PathBuf,
 
-    /// OTP authentication session TTL in seconds (default: 300 = 5 minutes)
+    /// OTP idle lock timeout in seconds; automatically renews on user activity (default: 300 = 5 minutes)
     #[arg(long, env = "OTERM_AUTH_TTL", default_value_t = 300)]
     pub auth_ttl: u64,
 
