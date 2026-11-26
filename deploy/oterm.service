@@ -1,0 +1,17 @@
+[Unit]
+Description=oterm: Online Terminal (Rust PTY Web Server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+Environment=RUST_LOG=oterm=info
+ExecStart=/usr/local/bin/oterm serve --bind 127.0.0.1:8782 --base-path /oterm --secret-path /etc/oterm/totp.secret --auth-ttl 300 --account xyz69.top
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

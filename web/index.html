@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content" />
+  <meta name="theme-color" content="#131620" />
+  <title>oterm — Online Terminal</title>
+  <link rel="stylesheet" href="./xterm.css" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <div class="topbar-left">
+        <div class="brand" title="oterm: Online Terminal">
+          <span id="conn-dot" class="dot dot-offline"></span>
+          <span class="brand-name">oterm</span>
+          <span id="rtt-badge" class="badge">--ms</span>
+        </div>
+        <div id="tabs-bar" class="tabs-bar"></div>
+        <button id="btn-new-tab" class="icon-btn" title="New terminal session (Alt+T)">+</button>
+      </div>
+
+      <div class="topbar-right">
+        <span id="size-badge" class="badge hide-sm">80×24</span>
+        <button id="btn-search" class="icon-btn" title="Search scrollback (Ctrl+Shift+F)">⌕</button>
+        <button id="btn-font-dec" class="icon-btn hide-sm" title="Decrease font (Ctrl+-)">A-</button>
+        <button id="btn-font-inc" class="icon-btn hide-sm" title="Increase font (Ctrl++)">A+</button>
+        <select id="theme-select" class="theme-select hide-sm" title="Terminal theme">
+          <option value="tokyo">Tokyo Night</option>
+          <option value="catppuccin">Catppuccin</option>
+          <option value="dracula">Dracula</option>
+          <option value="gruvbox">Gruvbox</option>
+          <option value="light">Solarized Light</option>
+        </select>
+        <button id="btn-mobile-bar" class="icon-btn" title="Toggle touch key bar">⌨</button>
+        <button id="btn-lock" class="ttl-pill" title="OTP session remaining — click to lock now">
+          <span class="lock-icon">🔒</span>
+          <span id="ttl-text">--:--</span>
+        </button>
+      </div>
+    </header>
+
+    <div id="search-bar" class="search-bar hidden">
+      <input id="search-input" type="text" placeholder="Search terminal..." autocomplete="off" spellcheck="false" />
+      <button id="search-regex" class="mini-btn" title="Regex">.*</button>
+      <button id="search-case" class="mini-btn" title="Match case">Aa</button>
+      <button id="search-prev" class="mini-btn" title="Previous (Shift+Enter)">↑</button>
+      <button id="search-next" class="mini-btn" title="Next (Enter)">↓</button>
+      <button id="search-close" class="mini-btn" title="Close (Esc)">✕</button>
+    </div>
+
+    <main id="terminal-wrap">
+      <div id="terminal-mount"></div>
+      <button id="btn-scroll-bottom" class="scroll-fab hidden" title="Scroll to bottom">↓ Latest</button>
+    </main>
+
+    <div id="mobile-bar" class="mobile-bar hidden">
+      <button data-key="Escape">Esc</button>
+      <button data-key="Tab">Tab</button>
+      <button id="mod-ctrl" data-mod="ctrl">Ctrl</button>
+      <button id="mod-alt" data-mod="alt">Alt</button>
+      <button data-seq="\x1b[A">↑</button>
+      <button data-seq="\x1b[B">↓</button>
+      <button data-seq="\x1b[D">←</button>
+      <button data-seq="\x1b[C">→</button>
+      <button data-seq="|">|</button>
+      <button data-seq="/">/</button>
+      <button data-seq="-">-</button>
+      <button data-seq="~">~</button>
+      <button data-seq="\x1b[H">Home</button>
+      <button data-seq="\x1b[F">End</button>
+      <button data-seq="\x1b[5~">PgUp</button>
+      <button data-seq="\x1b[6~">PgDn</button>
+      <button id="btn-mobile-paste">Paste</button>
+    </div>
+  </div>
+
+  <!-- OTP Auth / Lock Overlay (never clears terminal canvas underneath) -->
+  <div id="auth-overlay" class="auth-overlay">
+    <div class="auth-card">
+      <div class="auth-logo">
+        <span class="auth-prompt">$</span> oterm
+      </div>
+      <h2 id="auth-title">OTP Verification</h2>
+      <p id="auth-subtitle" class="auth-subtitle">
+        Enter the 6-digit code from your authenticator app.
+      </p>
+      <form id="auth-form" autocomplete="off">
+        <input
+          id="otp-input"
+          type="text"
+          inputmode="numeric"
+          pattern="[0-9]*"
+          maxlength="6"
+          autocomplete="one-time-code"
+          placeholder="000000"
+          autofocus
+        />
+        <button id="otp-submit" type="submit">Unlock Terminal</button>
+      </form>
+      <div id="auth-error" class="auth-error hidden"></div>
+      <div class="auth-footnote">
+        Server-bound TOTP · 5-minute session keepalive · PTY stays alive when locked
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
