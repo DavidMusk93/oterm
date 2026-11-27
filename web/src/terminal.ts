@@ -124,13 +124,21 @@ export const THEMES: Record<string, ITheme> = {
   },
 };
 
+export interface ScrollState {
+  atBottom: boolean;
+  linesAbove: number;
+}
+
 export interface TerminalCallbacks {
   onInput: (data: string) => void;
   onResize: (cols: number, rows: number) => void;
-  onAck: (endSeq: bigint) => void;
+  onAck: (endSeq: bigint, byteCount: number) => void;
   onOpenSearch: () => void;
-  onScrollStateChange: (atBottom: boolean) => void;
+  onScrollStateChange: (state: ScrollState) => void;
   transformStickyModifiers: (data: string) => string;
+  onKeyDown?: (ev: KeyboardEvent) => boolean;
+  onRendered?: () => void;
+  onLayoutChanged?: () => void;
 }
 
 export class OtermView {
@@ -142,6 +150,10 @@ export class OtermView {
   private readonly callbacks: TerminalCallbacks;
   private resizeTimer: number | null = null;
   private resizeObserver: ResizeObserver;
+  private lastAtBottom: boolean | null = null;
+  private lastLinesAbove = -1;
+  private writeQueue: Array<{ data: Uint8Array; endSeq: bigint; totalBytes: number; isLast: boolean }> = [];
+  private pumpScheduled = false;
 
   constructor(container: HTMLElement, callbacks: TerminalCallbacks) {
     this.container = container;
@@ -158,7 +170,7 @@ export class OtermView {
         '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Noto Sans Mono CJK SC", monospace',
       fontSize: Math.min(24, Math.max(10, savedFont)),
       lineHeight: 1.22,
-      scrollback: 10000,
+      scrollback: 50000,
       smoothScrollDuration: 90,
       macOptionIsMeta: true,
       rightClickSelectsWord: true,
@@ -187,9 +199,7 @@ export class OtermView {
     });
 
     this.term.onScroll(() => {
-      const buf = this.term.buffer.active;
-      const atBottom = buf.viewportY >= buf.baseY - 1;
-      this.callbacks.onScrollStateChange(atBottom);
+      this.emitScrollState();
     });
 
     this.resizeObserver = new ResizeObserver(() => this.scheduleFit());
@@ -225,6 +235,8 @@ export class OtermView {
   private installKeyHandlers(): void {
     this.term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
       if (ev.type !== "keydown") return true;
+      // Never intercept IME composition keys (Chinese/Japanese/Korean input methods)
+      if (ev.isComposing || ev.keyCode === 229) return true;
 
       // Ctrl+Shift+F -> Open scrollback search
       if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && ev.key.toLowerCase() === "f") {
@@ -282,6 +294,10 @@ export class OtermView {
         }
       }
 
+      if (this.callbacks.onKeyDown) {
+        return this.callbacks.onKeyDown(ev);
+      }
+
       return true;
     });
   }
@@ -290,27 +306,85 @@ export class OtermView {
     try {
       const text = await navigator.clipboard.readText();
       if (!text) return;
-      // Wrap in bracketed paste sequences so shells/vim treat paste safely
-      if (this.term.modes.bracketedPasteMode) {
-        this.callbacks.onInput(`\x1b[200~${text}\x1b[201~`);
-      } else {
-        this.callbacks.onInput(text);
-      }
+      // Use xterm's native paste() so bracketed paste (\x1b[200~...\x1b[201~),
+      // CRLF normalization, and escape sanitization are handled identically to Ctrl+V/Cmd+V.
+      this.term.paste(text);
     } catch {
       // Clipboard permission denied
     }
   }
 
   public writeChunk(data: Uint8Array, endSeq: bigint, fullReset = false): void {
+    const SLICE_SIZE = 16 * 1024;
     if (fullReset) {
+      // Preserve bracketed paste mode across fullReset so multi-line paste never breaks
+      const hadBracketedPaste = this.term.modes.bracketedPasteMode;
+      // Drop any stale queued slices when converging to a fresh collapsed snapshot
+      this.writeQueue.length = 0;
       this.term.reset();
+      if (hadBracketedPaste) {
+        this.term.write("\x1b[?2004h");
+      }
     }
-    // SOTA flow-control: send ACK only after xterm.js finishes parsing & rendering chunk
-    this.term.write(data, () => {
-      this.callbacks.onAck(endSeq);
-      const buf = this.term.buffer.active;
-      this.callbacks.onScrollStateChange(buf.viewportY >= buf.baseY - 1);
+
+    // Fast path for interactive typing / small chunks: zero-delay direct write
+    if (this.writeQueue.length === 0 && data.length <= SLICE_SIZE) {
+      const len = data.length;
+      this.term.write(data, () => {
+        this.callbacks.onAck(endSeq, len);
+        this.emitScrollState();
+        this.callbacks.onRendered?.();
+      });
+      return;
+    }
+
+    // Adaptive frame-budgeted chunked rendering for large bursts/snapshots:
+    // prevents main-thread jank and keeps input responsive at 60fps.
+    const totalBytes = data.length;
+    for (let offset = 0; offset < totalBytes; offset += SLICE_SIZE) {
+      const end = Math.min(offset + SLICE_SIZE, totalBytes);
+      const isLast = end >= totalBytes;
+      this.writeQueue.push({
+        data: data.subarray(offset, end),
+        endSeq,
+        totalBytes: isLast ? totalBytes : 0,
+        isLast,
+      });
+    }
+    this.schedulePump();
+  }
+
+  private schedulePump(): void {
+    if (this.pumpScheduled) return;
+    this.pumpScheduled = true;
+    window.requestAnimationFrame(() => {
+      this.pumpScheduled = false;
+      this.pumpWriteQueue();
     });
+  }
+
+  private pumpWriteQueue(): void {
+    const FRAME_BUDGET_MS = 8;
+    const start = performance.now();
+    while (this.writeQueue.length > 0) {
+      const item = this.writeQueue.shift()!;
+      if (item.isLast) {
+        const { endSeq, totalBytes } = item;
+        this.term.write(item.data, () => {
+          this.callbacks.onAck(endSeq, totalBytes);
+          this.emitScrollState();
+          this.callbacks.onRendered?.();
+        });
+      } else {
+        this.term.write(item.data);
+      }
+      if (performance.now() - start >= FRAME_BUDGET_MS) {
+        break;
+      }
+    }
+    if (this.writeQueue.length > 0) {
+      this.schedulePump();
+    }
   }
 
   public scheduleFit(): void {
@@ -332,6 +406,7 @@ export class OtermView {
     const cols = this.term.cols;
     const rows = this.term.rows;
     this.callbacks.onResize(cols, rows);
+    this.callbacks.onLayoutChanged?.();
     return { cols, rows };
   }
 
@@ -341,6 +416,7 @@ export class OtermView {
     this.term.options.theme = theme;
     localStorage.setItem("oterm_theme", name);
     document.documentElement.style.setProperty("--term-bg", theme.background || "#131620");
+    this.callbacks.onLayoutChanged?.();
   }
 
   public adjustFontSize(delta: number): void {
@@ -381,7 +457,105 @@ export class OtermView {
 
   public scrollToBottom(): void {
     this.term.scrollToBottom();
-    this.callbacks.onScrollStateChange(true);
+    this.emitScrollState();
+  }
+
+  private emitScrollState(): void {
+    const buf = this.term.buffer.active;
+    const linesAbove = Math.max(0, buf.baseY - buf.viewportY);
+    const atBottom = linesAbove <= 1;
+    if (atBottom === this.lastAtBottom && linesAbove === this.lastLinesAbove) {
+      return;
+    }
+    this.lastAtBottom = atBottom;
+    this.lastLinesAbove = linesAbove;
+    this.callbacks.onScrollStateChange({
+      atBottom,
+      linesAbove,
+    });
+  }
+
+  private findPromptRows(): number[] {
+    const buf = this.term.buffer.active;
+    const rows: number[] = [];
+    const promptRe = /^[^#$%❯➜\n]{1,80}[#$%❯➜]\s/;
+    const total = buf.length;
+    for (let i = 0; i < total; i++) {
+      const line = buf.getLine(i);
+      if (!line || line.isWrapped) continue;
+      const text = line.translateToString(true);
+      if (promptRe.test(text)) {
+        rows.push(i);
+      }
+    }
+    return rows;
+  }
+
+  public jumpPrevCommand(): void {
+    const buf = this.term.buffer.active;
+    const prompts = this.findPromptRows();
+    const curTop = buf.viewportY;
+    for (let i = prompts.length - 1; i >= 0; i--) {
+      if (prompts[i] < curTop - 1) {
+        this.term.scrollToLine(Math.max(0, prompts[i] - 1));
+        this.emitScrollState();
+        return;
+      }
+    }
+    if (prompts.length > 0) {
+      this.term.scrollToLine(Math.max(0, prompts[0] - 1));
+      this.emitScrollState();
+    }
+  }
+
+  public jumpNextCommand(): void {
+    const buf = this.term.buffer.active;
+    const prompts = this.findPromptRows();
+    const curTop = buf.viewportY;
+    for (let i = 0; i < prompts.length; i++) {
+      if (prompts[i] > curTop + 2) {
+        this.term.scrollToLine(Math.max(0, prompts[i] - 1));
+        this.emitScrollState();
+        return;
+      }
+    }
+    this.scrollToBottom();
+  }
+
+  public async copyLastBlock(): Promise<boolean> {
+    const buf = this.term.buffer.active;
+    const prompts = this.findPromptRows();
+    const endRow = buf.baseY + buf.cursorY;
+    let startRow = Math.max(0, endRow - 200);
+    let stopRow = endRow;
+
+    if (prompts.length >= 2) {
+      startRow = prompts[prompts.length - 2];
+      stopRow = prompts[prompts.length - 1] - 1;
+    } else if (prompts.length === 1) {
+      startRow = prompts[0];
+    }
+
+    const lines: string[] = [];
+    for (let r = startRow; r <= stopRow; r++) {
+      const line = buf.getLine(r);
+      if (!line) continue;
+      const text = line.translateToString(true);
+      if (line.isWrapped && lines.length > 0) {
+        lines[lines.length - 1] += text;
+      } else {
+        lines.push(text);
+      }
+    }
+
+    const block = lines.join("\n").trim();
+    if (!block) return false;
+    try {
+      await navigator.clipboard.writeText(block);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   public focus(): void {

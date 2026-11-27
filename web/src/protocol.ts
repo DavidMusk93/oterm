@@ -6,6 +6,8 @@ export const OP_ACK = 0x03;
 export const OP_PING = 0x04;
 export const OP_ATTACH = 0x05;
 export const OP_ACTIVITY = 0x06;
+export const OP_COMPLETE_REQ = 0x07;
+export const OP_CMD_RECORD = 0x08;
 
 export const OP_OUTPUT = 0x11;
 export const OP_SNAPSHOT = 0x12;
@@ -13,6 +15,8 @@ export const OP_PONG = 0x13;
 export const OP_SESSION = 0x14;
 export const OP_AUTH_LOCK = 0x15;
 export const OP_ERROR = 0x16;
+export const OP_COMPLETE_RES = 0x17;
+export const OP_CONTEXT = 0x18;
 
 export const SNAPSHOT_FLAG_FULL_RESET = 0x01;
 
@@ -31,13 +35,32 @@ export interface SessionInfo {
   end_seq: number;
 }
 
+export interface CompletionItem {
+  label: string;
+  insert_text: string;
+  replace_len: number;
+  ghost_suffix?: string;
+  kind: "history" | "dir" | "file" | "git" | "cmd" | "flag";
+  detail?: string;
+}
+
+export interface ContextInfo {
+  cwd: string;
+  git_branch?: string;
+  fg_command: string;
+  alt_screen: boolean;
+  echo_enabled?: boolean;
+}
+
 export type ServerFrame =
   | { type: "output"; endSeq: bigint; data: Uint8Array }
   | { type: "snapshot"; endSeq: bigint; fullReset: boolean; data: Uint8Array }
   | { type: "pong"; clientTsMs: bigint; authTtlSecs: number }
   | { type: "session"; info: SessionInfo }
   | { type: "auth_lock"; reason: string; ttl: number }
-  | { type: "error"; code: string; message: string };
+  | { type: "error"; code: string; message: string }
+  | { type: "complete_res"; seq: number; items: CompletionItem[] }
+  | { type: "context"; info: ContextInfo };
 
 export function encodeInput(strOrBytes: string | Uint8Array): Uint8Array {
   const payload = typeof strOrBytes === "string" ? textEncoder.encode(strOrBytes) : strOrBytes;
@@ -74,6 +97,22 @@ export function encodePing(clientTsMs: bigint): Uint8Array {
 
 export function encodeActivity(): Uint8Array {
   return new Uint8Array([OP_ACTIVITY]);
+}
+
+export function encodeCompleteReq(seq: number, line: string): Uint8Array {
+  const payload = textEncoder.encode(JSON.stringify({ seq, line }));
+  const out = new Uint8Array(1 + payload.length);
+  out[0] = OP_COMPLETE_REQ;
+  out.set(payload, 1);
+  return out;
+}
+
+export function encodeCmdRecord(cmd: string): Uint8Array {
+  const payload = textEncoder.encode(JSON.stringify({ cmd }));
+  const out = new Uint8Array(1 + payload.length);
+  out[0] = OP_CMD_RECORD;
+  out.set(payload, 1);
+  return out;
 }
 
 export function encodeAttach(
@@ -141,6 +180,17 @@ export function decodeServerFrame(buffer: ArrayBuffer): ServerFrame | null {
         message: string;
       };
       return { type: "error", code: obj.code, message: obj.message };
+    }
+    case OP_COMPLETE_RES: {
+      const obj = JSON.parse(textDecoder.decode(bytes.subarray(1))) as {
+        seq: number;
+        items: CompletionItem[];
+      };
+      return { type: "complete_res", seq: obj.seq, items: obj.items || [] };
+    }
+    case OP_CONTEXT: {
+      const info = JSON.parse(textDecoder.decode(bytes.subarray(1))) as ContextInfo;
+      return { type: "context", info };
     }
     default:
       return null;
