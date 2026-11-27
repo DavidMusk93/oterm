@@ -5,14 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content" />
   <meta name="theme-color" content="#131620" />
   <title>oterm — Online Terminal</title>
+  <link rel="icon" type="image/svg+xml" href="./logo.svg?v=3" />
   <link rel="stylesheet" href="./xterm.css" />
-  <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./styles.css?v=3" />
 </head>
 <body>
   <div id="app">
     <header id="topbar">
       <div class="topbar-left">
         <div class="brand" title="oterm: Online Terminal">
+          <img class="brand-logo" src="./logo.svg?v=3" alt="oterm" width="22" height="22" />
           <span id="conn-dot" class="dot dot-offline"></span>
           <span class="brand-name">oterm</span>
           <span id="rtt-badge" class="badge">--ms</span>
@@ -33,10 +35,11 @@
           <option value="gruvbox">Gruvbox</option>
           <option value="light">Solarized Light</option>
         </select>
+        <button id="btn-ac-toggle" class="icon-btn active" title="Toggle smart autocomplete (→ ghost / Tab accept)">✦</button>
         <button id="btn-mobile-bar" class="icon-btn" title="Toggle touch key bar">⌨</button>
-        <button id="btn-lock" class="ttl-pill" title="Idle lock countdown (auto-renews while active) — click to lock now">
+        <button id="btn-lock" class="lock-btn" title="Lock terminal now (sessions keep running in background; auto-locks when idle)">
           <span class="lock-icon">🔒</span>
-          <span id="ttl-text">--:--</span>
+          <span>Lock</span>
         </button>
       </div>
     </header>
@@ -52,8 +55,29 @@
 
     <main id="terminal-wrap">
       <div id="terminal-mount"></div>
-      <button id="btn-scroll-bottom" class="scroll-fab hidden" title="Scroll to bottom">↓ Latest</button>
+      <div id="local-echo" class="local-echo hidden"></div>
+      <div id="ac-ghost" class="ac-ghost hidden"></div>
+      <div id="ac-popup" class="ac-popup hidden"></div>
+      <div id="sticky-history-pill" class="sticky-pill hidden">
+        <span id="sticky-lines-text" class="sticky-meta">↑ History</span>
+        <button id="btn-sticky-prev" class="sticky-btn" title="Previous command block">↑ Prev</button>
+        <button id="btn-sticky-next" class="sticky-btn" title="Next command block">↓ Next</button>
+        <button id="btn-scroll-bottom" class="sticky-btn sticky-primary" title="Jump to latest output">↓ Latest</button>
+      </div>
     </main>
+
+    <footer id="context-bar" class="context-bar">
+      <div class="ctx-left">
+        <span id="ctx-cwd" class="ctx-chip ctx-cwd" title="Current working directory">~</span>
+        <span id="ctx-branch" class="ctx-chip ctx-branch hidden" title="Git branch"></span>
+        <span id="ctx-proc" class="ctx-chip ctx-proc" title="Foreground process">bash</span>
+      </div>
+      <div class="ctx-right">
+        <button id="btn-prev-cmd" class="ctx-action hide-sm" title="Jump to previous command block">↑ Prev Cmd</button>
+        <button id="btn-next-cmd" class="ctx-action hide-sm" title="Jump to next command block">↓ Next Cmd</button>
+        <button id="btn-copy-block" class="ctx-action" title="Copy last command &amp; output block">⧉ Copy Output</button>
+      </div>
+    </footer>
 
     <div id="mobile-bar" class="mobile-bar hidden">
       <button data-key="Escape">Esc</button>
@@ -80,32 +104,42 @@
   <div id="auth-overlay" class="auth-overlay">
     <div class="auth-card">
       <div class="auth-logo">
-        <span class="auth-prompt">$</span> oterm
+        <img class="auth-logo-img" src="./logo.svg?v=3" alt="oterm logo" width="60" height="60" />
+        <div class="auth-logo-text"><span class="auth-prompt">$</span> oterm</div>
       </div>
       <h2 id="auth-title">OTP Verification</h2>
       <p id="auth-subtitle" class="auth-subtitle">
         Enter the 6-digit code from your authenticator app.
       </p>
       <form id="auth-form" autocomplete="off">
-        <input
-          id="otp-input"
-          type="text"
-          inputmode="numeric"
-          pattern="[0-9]*"
-          maxlength="6"
-          autocomplete="one-time-code"
-          placeholder="000000"
-          autofocus
-        />
-        <button id="otp-submit" type="submit">Unlock Terminal</button>
+        <div id="otp-boxes" class="otp-boxes" aria-label="6-digit verification code">
+          <input
+            id="otp-input"
+            class="otp-hidden-input"
+            type="text"
+            inputmode="numeric"
+            pattern="[0-9]*"
+            maxlength="6"
+            autocomplete="one-time-code"
+            aria-label="6-digit OTP code"
+            autofocus
+          />
+          <div class="otp-slot" data-index="0"></div>
+          <div class="otp-slot" data-index="1"></div>
+          <div class="otp-slot" data-index="2"></div>
+          <div class="otp-slot" data-index="3"></div>
+          <div class="otp-slot" data-index="4"></div>
+          <div class="otp-slot" data-index="5"></div>
+        </div>
+        <div id="otp-status" class="otp-status hidden">Verifying…</div>
       </form>
       <div id="auth-error" class="auth-error hidden"></div>
       <div class="auth-footnote">
-        Server-bound TOTP · 5-min idle auto-lock (auto-renews while active) · PTY stays alive
+        Server-bound TOTP · Persistent tmux sessions · Auto-locks when idle
       </div>
     </div>
   </div>
 
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=3"></script>
 </body>
 </html>
