@@ -1,9 +1,11 @@
 use crate::assets::WebAssets;
 use crate::auth::{AuthError, AuthManager, COOKIE_NAME};
+use crate::complete::{CompletionEngine, CompletionResponse};
 use crate::config::ServeArgs;
 use crate::protocol::{
     decode_client_frame, encode_json_frame, encode_output, encode_pong, encode_snapshot,
-    AuthLockPayload, ClientFrame, ErrorPayload, OP_AUTH_LOCK, OP_ERROR, OP_SESSION,
+    AuthLockPayload, ClientFrame, ContextPayload, ErrorPayload, OP_AUTH_LOCK, OP_COMPLETE_RES,
+    OP_CONTEXT, OP_ERROR, OP_SESSION,
 };
 use crate::ringbuf::ReplaySlice;
 use crate::session::{SessionManager, TerminalSession};
@@ -14,15 +16,18 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
 const MAX_IN_FLIGHT_BYTES: u64 = 256 * 1024;
+const MAX_COALESCE_BYTES: usize = 32 * 1024;
 const WS_CLOSE_AUTH_EXPIRED: u16 = 4401;
 /// Transport cookie lifetime; actual session idle expiry is strictly enforced in `AuthManager`.
 const COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -31,6 +36,7 @@ const COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 pub struct AppState {
     pub auth: Arc<AuthManager>,
     pub sessions: Arc<SessionManager>,
+    pub completer: Arc<CompletionEngine>,
     pub base_path: String,
     pub secure_cookie: bool,
 }
@@ -69,17 +75,25 @@ pub async fn run_server(args: ServeArgs) -> anyhow::Result<()> {
         args.auth_ttl,
     )?);
 
+    let tmux_socket = if args.no_tmux {
+        None
+    } else {
+        Some(args.tmux_socket.clone())
+    };
     let sessions = Arc::new(SessionManager::new(
         args.resolved_shell(),
         args.resolved_cwd(),
         args.ring_buffer_bytes,
         args.max_sessions,
+        tmux_socket,
     ));
+    let completer = Arc::new(CompletionEngine::new());
 
     let base_path = args.normalized_base_path();
     let state = AppState {
         auth,
         sessions,
+        completer,
         base_path: base_path.clone(),
         secure_cookie: args.secure_cookie,
     };
@@ -489,6 +503,11 @@ impl Drop for ClientGuard {
     }
 }
 
+enum BgMsg {
+    Frame(Bytes),
+    Context(ContextPayload),
+}
+
 async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -497,9 +516,18 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
     let mut sent_seq: u64 = 0;
     let mut acked_seq: u64 = 0;
     let mut backpressure_paused = false;
+    let mut last_context: Option<ContextPayload> = None;
+
+    // Non-blocking channel for background autocomplete & context probe results so
+    // the WS input/output loop is NEVER stalled by tmux subprocesses or disk scans.
+    let (bg_tx, mut bg_rx) = mpsc::unbounded_channel::<BgMsg>();
+    let latest_complete_seq = Arc::new(AtomicU32::new(0));
+    let ctx_in_flight = Arc::new(AtomicBool::new(false));
 
     let mut auth_tick = tokio::time::interval(Duration::from_secs(1));
     auth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ctx_tick = tokio::time::interval(Duration::from_secs(2));
+    ctx_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Check if we can resume pumping after ACK freed flow-control window
@@ -518,11 +546,20 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                         sent_seq = end_seq;
                     }
                     ReplaySlice::FullSnapshot { end_seq, data } => {
-                        let frame = encode_snapshot(end_seq, true, &data);
+                        let sess_snap = Arc::clone(&guard.session);
+                        let snap_bytes = tokio::task::spawn_blocking(move || {
+                            sess_snap.capture_full_snapshot()
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or(data);
+                        let frame = encode_snapshot(end_seq, true, &snap_bytes);
                         if ws_tx.send(Message::Binary(frame)).await.is_err() {
                             break;
                         }
                         sent_seq = end_seq;
+                        acked_seq = end_seq.saturating_sub(snap_bytes.len() as u64);
                     }
                 }
             }
@@ -530,22 +567,9 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
         }
 
         tokio::select! {
-            _ = auth_tick.tick() => {
-                if state.auth.validate(&auth_token).is_none() {
-                    debug!("auth session expired during active WS; locking client without killing PTY");
-                    let lock_frame = encode_json_frame(OP_AUTH_LOCK, &AuthLockPayload {
-                        reason: "expired".to_string(),
-                        ttl: 0,
-                    });
-                    let _ = ws_tx.send(Message::Binary(lock_frame)).await;
-                    let _ = ws_tx.send(Message::Close(Some(CloseFrame {
-                        code: WS_CLOSE_AUTH_EXPIRED,
-                        reason: "auth_expired".into(),
-                    }))).await;
-                    break;
-                }
-            }
+            biased;
 
+            // Priority 1: Client input & control frames (lowest possible typing latency)
             incoming = ws_rx.next() => {
                 let Some(msg_res) = incoming else {
                     break;
@@ -603,17 +627,44 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                                             break;
                                         }
                                         sent_seq = end_seq;
-                                        acked_seq = req.last_seq;
+                                        acked_seq = end_seq.saturating_sub(data.len() as u64);
                                     }
                                     ReplaySlice::FullSnapshot { end_seq, data } => {
-                                        let frame = encode_snapshot(end_seq, true, &data);
+                                        // Instant collapsed current-state snapshot (~15-35 KiB):
+                                        // collapses megabytes of background TUI/spinner frames into
+                                        // the exact current screen + recent scrollback.
+                                        let sess_snap = Arc::clone(&sess);
+                                        let snap_bytes = tokio::task::spawn_blocking(move || {
+                                            sess_snap.capture_full_snapshot()
+                                        })
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(data);
+                                        let frame = encode_snapshot(end_seq, true, &snap_bytes);
                                         if ws_tx.send(Message::Binary(frame)).await.is_err() {
                                             break;
                                         }
                                         sent_seq = end_seq;
-                                        acked_seq = end_seq.saturating_sub(data.len() as u64);
+                                        acked_seq = end_seq.saturating_sub(snap_bytes.len() as u64);
                                     }
                                 }
+
+                                // Push initial Warp-style context asynchronously without blocking attach
+                                last_context = None;
+                                let sess_ctx = Arc::clone(&sess);
+                                let tx_ctx = bg_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(ctx) = tokio::task::spawn_blocking(move || sess_ctx.inspect_context()).await {
+                                        let _ = tx_ctx.send(BgMsg::Context(ContextPayload {
+                                            cwd: ctx.cwd.to_string_lossy().to_string(),
+                                            git_branch: ctx.git_branch,
+                                            fg_command: ctx.fg_command,
+                                            alt_screen: ctx.alt_screen,
+                                            echo_enabled: ctx.echo_enabled,
+                                        }));
+                                    }
+                                });
 
                                 attached = Some(guard);
                                 pty_rx = Some(rx);
@@ -622,6 +673,9 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                             Ok(ClientFrame::Input(bytes)) => {
                                 let _ = state.auth.touch(&auth_token);
                                 if let Some(guard) = &attached {
+                                    if bytes.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0x03) {
+                                        guard.session.invalidate_context_cache();
+                                    }
                                     let _ = guard.session.write_input(&bytes);
                                 }
                             }
@@ -644,6 +698,59 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                                     break;
                                 }
                             }
+                            Ok(ClientFrame::CompleteReq(req)) => {
+                                if let Some(guard) = &attached {
+                                    let seq = req.seq;
+                                    latest_complete_seq.store(seq, Ordering::Release);
+                                    let sess = Arc::clone(&guard.session);
+                                    let engine = Arc::clone(&state.completer);
+                                    let latest = Arc::clone(&latest_complete_seq);
+                                    let tx = bg_tx.clone();
+                                    let line = req.line;
+                                    tokio::spawn(async move {
+                                        let latest_inner = Arc::clone(&latest);
+                                        let resp = tokio::task::spawn_blocking(move || {
+                                            if latest_inner.load(Ordering::Acquire) != seq {
+                                                return None;
+                                            }
+                                            let ctx = sess.inspect_context_cached();
+                                            if !ctx.is_safe_for_completion() {
+                                                return Some(CompletionResponse {
+                                                    seq,
+                                                    items: Vec::new(),
+                                                });
+                                            }
+                                            if latest_inner.load(Ordering::Acquire) != seq {
+                                                return None;
+                                            }
+                                            Some(engine.complete(&sess.id, &line, &ctx.cwd, seq))
+                                        })
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                        if let Some(resp) = resp {
+                                            if latest.load(Ordering::Acquire) == seq {
+                                                let frame = encode_json_frame(OP_COMPLETE_RES, &resp);
+                                                let _ = tx.send(BgMsg::Frame(frame));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            Ok(ClientFrame::CmdRecord(req)) => {
+                                if let Some(guard) = &attached {
+                                    guard.session.invalidate_context_cache();
+                                    let sess = Arc::clone(&guard.session);
+                                    let engine = Arc::clone(&state.completer);
+                                    let cmd = req.cmd;
+                                    tokio::task::spawn_blocking(move || {
+                                        let ctx = sess.inspect_context_cached();
+                                        if ctx.is_safe_for_completion() {
+                                            engine.record_command(&sess.id, &cmd, &ctx.cwd);
+                                        }
+                                    });
+                                }
+                            }
                             Err(e) => {
                                 debug!("bad client frame: {e}");
                             }
@@ -657,23 +764,54 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                 }
             }
 
+            // Priority 2: Live PTY output echo to client (with burst coalescing for harsh networks)
             chunk_res = recv_pty_opt(&mut pty_rx), if pty_rx.is_some() && !backpressure_paused => {
                 match chunk_res {
                     Ok(chunk) => {
                         if chunk.end_seq <= sent_seq {
                             continue;
                         }
-                        let frame = encode_output(chunk.end_seq, &chunk.data);
+                        let mut end_seq = chunk.end_seq;
+                        let mut coalesced: Option<bytes::BytesMut> = None;
+                        let first_data = chunk.data;
+
+                        // Drain immediately-queued burst chunks up to MAX_COALESCE_BYTES
+                        if let Some(rx) = pty_rx.as_mut() {
+                            while coalesced.as_ref().map_or(first_data.len(), |b| b.len()) < MAX_COALESCE_BYTES {
+                                match rx.try_recv() {
+                                    Ok(next) => {
+                                        if next.end_seq <= end_seq {
+                                            continue;
+                                        }
+                                        let buf = coalesced.get_or_insert_with(|| {
+                                            let mut b = bytes::BytesMut::with_capacity(
+                                                (first_data.len() + next.data.len()).min(MAX_COALESCE_BYTES)
+                                            );
+                                            b.extend_from_slice(&first_data);
+                                            b
+                                        });
+                                        buf.extend_from_slice(&next.data);
+                                        end_seq = next.end_seq;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+
+                        let frame = match coalesced {
+                            Some(buf) => encode_output(end_seq, &buf),
+                            None => encode_output(end_seq, &first_data),
+                        };
                         if ws_tx.send(Message::Binary(frame)).await.is_err() {
                             break;
                         }
-                        sent_seq = chunk.end_seq;
+                        sent_seq = end_seq;
                         if sent_seq.saturating_sub(acked_seq) >= MAX_IN_FLIGHT_BYTES {
                             backpressure_paused = true;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Resync seamlessly from ring buffer
+                        // Resync seamlessly using collapsed current-state snapshot if far behind
                         if let Some(guard) = &attached {
                             match guard.session.slice_from(sent_seq) {
                                 ReplaySlice::UpToDate { end_seq } => sent_seq = end_seq,
@@ -685,17 +823,90 @@ async fn handle_ws(socket: WebSocket, state: AppState, auth_token: String) {
                                     sent_seq = end_seq;
                                 }
                                 ReplaySlice::FullSnapshot { end_seq, data } => {
-                                    let frame = encode_snapshot(end_seq, true, &data);
+                                    let sess_snap = Arc::clone(&guard.session);
+                                    let snap_bytes = tokio::task::spawn_blocking(move || {
+                                        sess_snap.capture_full_snapshot()
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or(data);
+                                    let frame = encode_snapshot(end_seq, true, &snap_bytes);
                                     if ws_tx.send(Message::Binary(frame)).await.is_err() {
                                         break;
                                     }
                                     sent_seq = end_seq;
+                                    acked_seq = end_seq.saturating_sub(snap_bytes.len() as u64);
                                 }
                             }
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         pty_rx = None;
+                    }
+                }
+            }
+
+            // Priority 3: Background autocomplete & context results
+            Some(bg) = bg_rx.recv() => {
+                match bg {
+                    BgMsg::Frame(frame) => {
+                        if ws_tx.send(Message::Binary(frame)).await.is_err() {
+                            break;
+                        }
+                    }
+                    BgMsg::Context(payload) => {
+                        if last_context.as_ref() != Some(&payload) {
+                            let frame = encode_json_frame(OP_CONTEXT, &payload);
+                            if ws_tx.send(Message::Binary(frame)).await.is_err() {
+                                break;
+                            }
+                            last_context = Some(payload);
+                        }
+                    }
+                }
+            }
+
+            // Priority 4: Auth idle expiry check
+            _ = auth_tick.tick() => {
+                if state.auth.validate(&auth_token).is_none() {
+                    debug!("auth session expired during active WS; locking client without killing PTY");
+                    let lock_frame = encode_json_frame(OP_AUTH_LOCK, &AuthLockPayload {
+                        reason: "expired".to_string(),
+                        ttl: 0,
+                    });
+                    let _ = ws_tx.send(Message::Binary(lock_frame)).await;
+                    let _ = ws_tx.send(Message::Close(Some(CloseFrame {
+                        code: WS_CLOSE_AUTH_EXPIRED,
+                        reason: "auth_expired".into(),
+                    }))).await;
+                    break;
+                }
+            }
+
+            // Priority 5: Non-blocking periodic context refresh (never stalls WS loop)
+            _ = ctx_tick.tick(), if attached.is_some() => {
+                if let Some(guard) = &attached {
+                    if ctx_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let sess = Arc::clone(&guard.session);
+                        let tx = bg_tx.clone();
+                        let flag = Arc::clone(&ctx_in_flight);
+                        tokio::spawn(async move {
+                            let res = tokio::task::spawn_blocking(move || sess.inspect_context()).await;
+                            flag.store(false, Ordering::Release);
+                            if let Ok(ctx) = res {
+                                let _ = tx.send(BgMsg::Context(ContextPayload {
+                                    cwd: ctx.cwd.to_string_lossy().to_string(),
+                                    git_branch: ctx.git_branch,
+                                    fg_command: ctx.fg_command,
+                                    alt_screen: ctx.alt_screen,
+                                    echo_enabled: ctx.echo_enabled,
+                                }));
+                            }
+                        });
                     }
                 }
             }

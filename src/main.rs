@@ -1,5 +1,6 @@
 mod assets;
 mod auth;
+mod complete;
 mod config;
 mod protocol;
 mod ringbuf;

@@ -8,6 +8,8 @@ pub const OP_ACK: u8 = 0x03;
 pub const OP_PING: u8 = 0x04;
 pub const OP_ATTACH: u8 = 0x05;
 pub const OP_ACTIVITY: u8 = 0x06;
+pub const OP_COMPLETE_REQ: u8 = 0x07;
+pub const OP_CMD_RECORD: u8 = 0x08;
 
 // Server -> Client opcodes
 pub const OP_OUTPUT: u8 = 0x11;
@@ -16,6 +18,8 @@ pub const OP_PONG: u8 = 0x13;
 pub const OP_SESSION: u8 = 0x14;
 pub const OP_AUTH_LOCK: u8 = 0x15;
 pub const OP_ERROR: u8 = 0x16;
+pub const OP_COMPLETE_RES: u8 = 0x17;
+pub const OP_CONTEXT: u8 = 0x18;
 
 pub const SNAPSHOT_FLAG_FULL_RESET: u8 = 0x01;
 
@@ -63,6 +67,27 @@ pub struct ErrorPayload {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContextPayload {
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    pub fg_command: String,
+    pub alt_screen: bool,
+    pub echo_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompleteReqPayload {
+    pub seq: u32,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CmdRecordPayload {
+    pub cmd: String,
+}
+
 #[derive(Debug)]
 pub enum ClientFrame {
     Input(Bytes),
@@ -71,6 +96,8 @@ pub enum ClientFrame {
     Ping { client_ts_ms: u64 },
     Attach(AttachPayload),
     Activity,
+    CompleteReq(CompleteReqPayload),
+    CmdRecord(CmdRecordPayload),
 }
 
 pub fn decode_client_frame(mut data: Bytes) -> Result<ClientFrame, String> {
@@ -110,6 +137,16 @@ pub fn decode_client_frame(mut data: Bytes) -> Result<ClientFrame, String> {
             Ok(ClientFrame::Attach(payload))
         }
         OP_ACTIVITY => Ok(ClientFrame::Activity),
+        OP_COMPLETE_REQ => {
+            let payload: CompleteReqPayload = serde_json::from_slice(&data)
+                .map_err(|e| format!("invalid complete_req json: {e}"))?;
+            Ok(ClientFrame::CompleteReq(payload))
+        }
+        OP_CMD_RECORD => {
+            let payload: CmdRecordPayload = serde_json::from_slice(&data)
+                .map_err(|e| format!("invalid cmd_record json: {e}"))?;
+            Ok(ClientFrame::CmdRecord(payload))
+        }
         other => Err(format!("unknown client opcode 0x{other:02x}")),
     }
 }

@@ -81,7 +81,19 @@ impl SeqRingBuffer {
     }
 
     /// Extract either exact delta bytes from `last_seq` or a full snapshot of the buffer.
+    /// Deltas larger than 48 KiB fast-forward to `FullSnapshot` so the server can send
+    /// a collapsed current-state tmux snapshot (~15-35 KiB) instead of replaying megabytes
+    /// of stale TUI/spinner frames after unlock or network recovery.
     pub fn slice_from(&self, last_seq: u64) -> ReplaySlice {
+        self.slice_from_capped(last_seq, 128 * 1024, 48 * 1024)
+    }
+
+    pub fn slice_from_capped(
+        &self,
+        last_seq: u64,
+        max_full_snapshot: usize,
+        max_delta_bytes: usize,
+    ) -> ReplaySlice {
         if last_seq >= self.end_seq {
             return ReplaySlice::UpToDate {
                 end_seq: self.end_seq,
@@ -89,15 +101,19 @@ impl SeqRingBuffer {
         }
 
         if last_seq > 0 && last_seq >= self.start_seq {
-            let skip = (last_seq - self.start_seq) as usize;
-            let data = self.collect_skipping(skip);
-            return ReplaySlice::Delta {
-                end_seq: self.end_seq,
-                data,
-            };
+            let delta_len = (self.end_seq - last_seq) as usize;
+            if delta_len <= max_delta_bytes {
+                let skip = (last_seq - self.start_seq) as usize;
+                let data = self.collect_skipping(skip);
+                return ReplaySlice::Delta {
+                    end_seq: self.end_seq,
+                    data,
+                };
+            }
         }
 
-        let data = self.collect_skipping(0);
+        let skip = self.total_bytes.saturating_sub(max_full_snapshot);
+        let data = self.collect_skipping(skip);
         ReplaySlice::FullSnapshot {
             end_seq: self.end_seq,
             data,

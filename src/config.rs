@@ -34,13 +34,21 @@ pub struct ServeArgs {
     #[arg(long, env = "OTERM_SECRET_PATH", default_value = "/etc/oterm/totp.secret")]
     pub secret_path: PathBuf,
 
-    /// OTP idle lock timeout in seconds; automatically renews on user activity (default: 300 = 5 minutes)
-    #[arg(long, env = "OTERM_AUTH_TTL", default_value_t = 300)]
+    /// OTP idle lock timeout in seconds; automatically renews on user activity (default: 1800 = 30 minutes)
+    #[arg(long, env = "OTERM_AUTH_TTL", default_value_t = 1800)]
     pub auth_ttl: u64,
 
-    /// Per-session scrollback ring buffer size in bytes (default: 4 MiB)
-    #[arg(long, env = "OTERM_RING_BUFFER_BYTES", default_value_t = 4 * 1024 * 1024)]
+    /// Per-session scrollback ring buffer size in bytes (default: 100 MiB)
+    #[arg(long, env = "OTERM_RING_BUFFER_BYTES", default_value_t = 100 * 1024 * 1024)]
     pub ring_buffer_bytes: usize,
+
+    /// Dedicated tmux socket name for restart-proof persistent sessions
+    #[arg(long, env = "OTERM_TMUX_SOCKET", default_value = "oterm")]
+    pub tmux_socket: String,
+
+    /// Disable tmux persistence backend even if tmux is installed
+    #[arg(long, env = "OTERM_NO_TMUX", default_value_t = false)]
+    pub no_tmux: bool,
 
     /// Maximum concurrent persistent PTY sessions
     #[arg(long, env = "OTERM_MAX_SESSIONS", default_value_t = 16)]
