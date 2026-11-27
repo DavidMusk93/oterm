@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --minify --sourcemap --format=esm --outfile=dist/app.js && cp index.html dist/index.html && cp src/styles.css dist/styles.css && cp node_modules/@xterm/xterm/css/xterm.css dist/xterm.css",
+    "build": "esbuild src/main.ts --bundle --minify --sourcemap --format=esm --outfile=dist/app.js && cp index.html dist/index.html && cp logo.svg dist/logo.svg && cp src/styles.css dist/styles.css && cp node_modules/@xterm/xterm/css/xterm.css dist/xterm.css",
     "dev": "esbuild src/main.ts --bundle --sourcemap --format=esm --outfile=dist/app.js --watch"
   },
   "dependencies": {
